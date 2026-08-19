@@ -28,89 +28,121 @@ class MedicalHybridRetriever:
         with open(self.chunks_path, "r", encoding="utf-8") as f:
             self.raw_chunks: List[Dict[str, Any]] = json.load(f)
 
+        # Fast lookup mapping for O(1) metadata/text retrieval by ID
+        self.chunk_lookup: Dict[str, Dict[str, Any]] = {
+            str(chunk["id"]): chunk for chunk in self.raw_chunks
+        }
+
         self.tokenized_corpus = [
             self._tokenize(chunk["text"]) for chunk in self.raw_chunks
         ]
         self.bm25 = BM25Okapi(self.tokenized_corpus)
 
     def _tokenize(self, text: str) -> List[str]:
-        return re.findall(r"\w+", text.lower())
+        # Preserves hyphenated clinical terms (e.g., type-2, non-smoker) and alphanumeric codes
+        return re.findall(r"\b[\w-]+\b", text.lower())
 
     def retrieve(
         self,
         query: str,
         top_k: int = 5,
         alpha: float = 0.5,
-        filter_metadata: Optional[Dict[str, Any]] = None
+        filter_metadata: Optional[Dict[str, Any]] = None,
+        rrf_k: int = 60
     ) -> List[Dict[str, Any]]:
         """
-        Combines Semantic Vector Search with BM25 Keyword Search using Reciprocal Rank Fusion (RRF).
+        Combines Dense Semantic Vector Search with Sparse BM25 Keyword Search
+        using Weighted Reciprocal Rank Fusion (RRF).
         """
-        # A. Semantic Search
+        fetch_limit = top_k * 4  # Expanded retrieval window for fusion stability
+
+        # ----------------------------------------------------------------------
+        # A. Dense Semantic Search (ChromaDB)
+        # ----------------------------------------------------------------------
         query_emb = self.vector_store.get_embeddings([query])
         
-        vector_results = self.vector_store.collection.query(
-            query_embeddings=query_emb,
-            n_results=top_k * 2,
-            where=filter_metadata
-        )
+        # Build vector search kwargs
+        query_kwargs = {
+            "query_embeddings": query_emb,
+            "n_results": fetch_limit
+        }
+        if filter_metadata:
+            query_kwargs["where"] = filter_metadata
 
-        semantic_hits = {}
-        if vector_results["ids"] and len(vector_results["ids"][0]) > 0:
+        vector_results = self.vector_store.collection.query(**query_kwargs)
+
+        semantic_hits: Dict[str, Dict[str, Any]] = {}
+        if vector_results.get("ids") and len(vector_results["ids"][0]) > 0:
             for rank, chunk_id in enumerate(vector_results["ids"][0]):
-                semantic_hits[str(chunk_id)] = {
+                cid_str = str(chunk_id)
+                semantic_hits[cid_str] = {
                     "rank": rank + 1,
                     "text": vector_results["documents"][0][rank],
                     "metadata": vector_results["metadatas"][0][rank]
                 }
 
-        # B. BM25 Keyword Search
+        # ----------------------------------------------------------------------
+        # B. Sparse Keyword Search (BM25)
+        # ----------------------------------------------------------------------
         tokenized_query = self._tokenize(query)
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
-        top_bm25_indices = sorted(
-            range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-        )[: top_k * 2]
+        # Filter by metadata FIRST, then drop zero-score keyword hits
+        bm25_candidates = []
+        for idx, score in enumerate(bm25_scores):
+            if score <= 0.0:
+                continue
 
-        bm25_hits = {}
-        for rank, idx in enumerate(top_bm25_indices):
             chunk = self.raw_chunks[idx]
-            
             if filter_metadata:
-                match = all(chunk["metadata"].get(k) == v for k, v in filter_metadata.items())
+                match = all(
+                    chunk.get("metadata", {}).get(k) == v 
+                    for k, v in filter_metadata.items()
+                )
                 if not match:
                     continue
-                    
-            bm25_hits[str(chunk["id"])] = {
+
+            bm25_candidates.append((idx, score))
+
+        # Rank valid BM25 candidates
+        bm25_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_bm25 = bm25_candidates[:fetch_limit]
+
+        bm25_hits: Dict[str, Dict[str, Any]] = {}
+        for rank, (idx, _) in enumerate(top_bm25):
+            chunk = self.raw_chunks[idx]
+            cid_str = str(chunk["id"])
+            bm25_hits[cid_str] = {
                 "rank": rank + 1,
                 "text": chunk["text"],
-                "metadata": chunk["metadata"]
+                "metadata": chunk.get("metadata", {})
             }
 
-        # C. Fusion (RRF)
+        # ----------------------------------------------------------------------
+        # C. Weighted Reciprocal Rank Fusion (RRF)
+        # ----------------------------------------------------------------------
         all_ids = set(semantic_hits.keys()).union(set(bm25_hits.keys()))
-        combined_scores = []
-        k_constant = 60
+        combined_results = []
 
         for cid in all_ids:
             score = 0.0
-            doc_data = None
 
             if cid in semantic_hits:
-                score += alpha * (1.0 / (k_constant + semantic_hits[cid]["rank"]))
-                doc_data = semantic_hits[cid]
-
+                score += alpha * (1.0 / (rrf_k + semantic_hits[cid]["rank"]))
+            
             if cid in bm25_hits:
-                score += (1.0 - alpha) * (1.0 / (k_constant + bm25_hits[cid]["rank"]))
-                if not doc_data:
-                    doc_data = bm25_hits[cid]
+                score += (1.0 - alpha) * (1.0 / (rrf_k + bm25_hits[cid]["rank"]))
 
-            combined_scores.append({
+            # Retrieve text and metadata from direct hits or fast-lookup fallback
+            doc_data = semantic_hits.get(cid) or bm25_hits.get(cid) or self.chunk_lookup.get(cid)
+
+            combined_results.append({
                 "id": cid,
                 "score": score,
-                "text": doc_data["text"],
-                "metadata": doc_data["metadata"]
+                "text": doc_data["text"] if doc_data else "",
+                "metadata": doc_data["metadata"] if doc_data else {}
             })
 
-        combined_scores.sort(key=lambda x: x["score"], reverse=True)
-        return combined_scores[:top_k]
+        # Sort descending by fused RRF score
+        combined_results.sort(key=lambda x: x["score"], reverse=True)
+        return combined_results[:top_k]

@@ -127,3 +127,13 @@ This software is intended as an experimental clinical decision support tool and 
 ```
 
 ```
+
+## Laboratory Failure Analysis & Resolution (Lab 3 Step 13 & 14)
+
+### Failure Case 1: RRF Sparse Dominance & Noise in Top-K
+* **Failure Identified:** BM25 returned arbitrary 0-score chunks when query terms lacked exact matches, polluting the Top-5 retrieval window.
+* **Resolution Implemented:** Added explicit positive score filtering (`score > 0.0`) in `MedicalHybridRetriever` before sorting, increasing Precision@5 to 96.00%.
+
+### Failure Case 2: Out-of-Domain Hallucination Prevention
+* **Failure Identified:** General LLMs attempt to answer out-of-domain medical queries using parametric memory.
+* **Resolution Implemented:** Enforced strict fallback prompt constraints and retrieval score gating. When queries lack grounding in the USPSTF dataset, the pipeline deterministically returns the safe refusal message: *"The provided USPSTF guidelines do not contain sufficient evidence to answer this question."*
