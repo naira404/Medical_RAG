@@ -1,8 +1,7 @@
 
 # USPSTF Clinical Decision Support — Medical RAG Backend
 
-Production-ready Retrieval-Augmented Generation (RAG) backend engine specialized in **US Preventive Services Task Force (USPSTF)** clinical guidelines. 
-
+Medical Clinical Guideline RAG — Hybrid Retrieval & Safety-Aware Generation 
 This repository contains the core AI retrieval, vector indexing, hybrid search, and grounded LLM generation layers designed for integration into web platforms and clinical interfaces.
 
 ---
